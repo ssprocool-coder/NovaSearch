@@ -14,26 +14,35 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show project structure
+      - name: Extract NovaSearch
         run: |
-          echo "Repository:"
-          ls -la
-          echo "NovaSearch:"
-          ls -la novasearch-v2
-          echo "Android:"
-          ls -la novasearch-v2/android
+          mkdir -p project
+          tar -xzf novasearch-v2.tar.gz -C project
+          echo "Extracted files:"
+          find project -maxdepth 3 -type f | sort
+
+      - name: Find Android project
+        run: |
+          ANDROID_DIR=$(find project -type f -name "settings.gradle" -printf '%h\n' | head -1)
+
+          if [ -z "$ANDROID_DIR" ]; then
+            echo "ERROR: Android project not found"
+            exit 1
+          fi
+
+          echo "Android project found at: $ANDROID_DIR"
+          echo "ANDROID_DIR=$ANDROID_DIR" >> "$GITHUB_ENV"
 
       - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
-          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK 34
+      - name: Install Android SDK
         run: |
           sdkmanager "platform-tools"
           sdkmanager "platforms;android-34"
@@ -45,26 +54,23 @@ jobs:
           gradle-version: '8.2'
 
       - name: Verify Android project
-        working-directory: novasearch-v2/android
         run: |
-          echo "Gradle:"
+          cd "$ANDROID_DIR"
           gradle --version
-
-          echo "Android files:"
           find . -maxdepth 3 -type f | sort
 
-      - name: Build Debug APK
-        working-directory: novasearch-v2/android
+      - name: Build APK
         run: |
+          cd "$ANDROID_DIR"
           gradle assembleDebug --stacktrace --no-daemon
 
       - name: Find APK
         run: |
-          find novasearch-v2/android -type f -name "*.apk" -print
+          find project -type f -name "*.apk" -print
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: NovaSearch-debug-apk
-          path: novasearch-v2/android/app/build/outputs/apk/debug/*.apk
+          path: project/**/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
