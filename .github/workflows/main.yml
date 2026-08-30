@@ -1,4 +1,4 @@
-name: Build NovaSearch APK
+name: Build NovaSearch V2 APK
 
 on:
   workflow_dispatch:
@@ -11,33 +11,76 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Download repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract NovaSearch
+      # 2. Extract Claude's NovaSearch archive
+      - name: Extract NovaSearch V2
+        shell: bash
         run: |
+          set -e
+
+          echo "===== Repository ====="
+          ls -lah
+
+          ARCHIVE="NovaSearch-V2.tar.gz"
+
+          if [ ! -f "$ARCHIVE" ]; then
+            echo "ERROR: $ARCHIVE was not found."
+            echo "Available files:"
+            find . -maxdepth 2 -type f -print
+            exit 1
+          fi
+
           rm -rf project
           mkdir -p project
-          tar -xzf novasearch-v2.tar.gz -C project
 
-          echo "===== Project ====="
+          tar -xzf "$ARCHIVE" -C project
+
+          echo "===== Extracted files ====="
           find project -maxdepth 4 -type f | sort
 
+      # 3. Find Android project automatically
       - name: Find Android project
+        shell: bash
         run: |
-          ANDROID_DIR=$(find "$GITHUB_WORKSPACE/project" \
+          set -e
+
+          ANDROID_DIR=""
+
+          while IFS= read -r settings; do
+            candidate="$(dirname "$settings")"
+
+            if [ -f "$candidate/app/build.gradle" ] || \
+               [ -f "$candidate/app/build.gradle.kts" ]; then
+              ANDROID_DIR="$candidate"
+              break
+            fi
+          done < <(find "$GITHUB_WORKSPACE/project" \
             -type f \
-            -name "settings.gradle" \
-            -printf '%h\n' | head -n 1)
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            -print)
 
           if [ -z "$ANDROID_DIR" ]; then
-            echo "ERROR: Android project not found"
+            echo "ERROR: Complete Android project was not found."
+            echo "Android-related files:"
+            find project -type f \
+              \( -name "settings.gradle" \
+              -o -name "build.gradle" \
+              -o -name "build.gradle.kts" \
+              -o -name "AndroidManifest.xml" \) \
+              -print
             exit 1
           fi
 
           echo "ANDROID_DIR=$ANDROID_DIR" >> "$GITHUB_ENV"
-          echo "Found: $ANDROID_DIR"
 
+          echo "===== Android project ====="
+          echo "$ANDROID_DIR"
+          find "$ANDROID_DIR" -maxdepth 4 -type f | sort
+
+      # 4. Java 17
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -49,10 +92,12 @@ jobs:
           java -version
           echo "JAVA_HOME=$JAVA_HOME"
 
+      # 5. Android SDK
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK
+      - name: Install Android SDK 34
+        shell: bash
         run: |
           yes | sdkmanager --licenses || true
 
@@ -61,41 +106,29 @@ jobs:
             "platforms;android-34" \
             "build-tools;34.0.0"
 
+      # 6. Gradle 8.2
       - name: Set up Gradle 8.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.2"
 
-      - name: Fix Android configuration
+      # 7. Fix AndroidX and namespace if required
+      - name: Prepare Android project
+        shell: bash
         run: |
+          set -e
+
           APP_GRADLE="$ANDROID_DIR/app/build.gradle"
           PROPS="$ANDROID_DIR/gradle.properties"
 
-          echo "===== app/build.gradle ====="
-          cat "$APP_GRADLE"
-
-          python3 - "$APP_GRADLE" <<'PY'
-          import sys
-          from pathlib import Path
-
-          path = Path(sys.argv[1])
-          text = path.read_text()
-
-          if 'namespace "com.novasearch.browser"' not in text:
-              if "android {" in text:
-                  text = text.replace(
-                      "android {",
-                      'android {\n    namespace "com.novasearch.browser"',
-                      1
-                  )
-              else:
-                  raise SystemExit("ERROR: android block not found")
-
-          path.write_text(text)
-          PY
+          if [ ! -f "$APP_GRADLE" ]; then
+            echo "ERROR: app/build.gradle not found."
+            exit 1
+          fi
 
           touch "$PROPS"
 
+          # Enable AndroidX
           if grep -q "^android.useAndroidX=" "$PROPS"; then
             sed -i \
               's/^android.useAndroidX=.*/android.useAndroidX=true/' \
@@ -104,6 +137,7 @@ jobs:
             echo "android.useAndroidX=true" >> "$PROPS"
           fi
 
+          # Enable Jetifier
           if grep -q "^android.enableJetifier=" "$PROPS"; then
             sed -i \
               's/^android.enableJetifier=.*/android.enableJetifier=true/' \
@@ -112,34 +146,63 @@ jobs:
             echo "android.enableJetifier=true" >> "$PROPS"
           fi
 
+          # Add namespace if missing
+          if ! grep -q "namespace" "$APP_GRADLE"; then
+            python3 - "$APP_GRADLE" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          if "android {" not in text:
+              raise SystemExit("ERROR: android { block not found")
+
+          text = text.replace(
+              "android {",
+              'android {\n    namespace "com.novasearch.browser"',
+              1
+          )
+
+          path.write_text(text)
+          PY
+          fi
+
           echo "===== gradle.properties ====="
           cat "$PROPS"
 
-      - name: Verify build environment
+          echo "===== app/build.gradle ====="
+          cat "$APP_GRADLE"
+
+      # 8. Check Gradle project
+      - name: Verify Gradle project
+        shell: bash
         run: |
-          echo "===== Java ====="
-          java -version
+          set -e
 
-          echo "===== Gradle ====="
-          gradle --version
-
-          echo "===== Android SDK ====="
-          sdkmanager --list_installed | head -80
-
-          echo "===== Android project ====="
-          find "$ANDROID_DIR" -maxdepth 3 -type f | sort
-
-      - name: Build Debug APK
-        run: |
           cd "$ANDROID_DIR"
 
-          echo "Building NovaSearch..."
+          echo "===== Gradle version ====="
+          gradle --version
+
+          echo "===== Gradle tasks ====="
+          gradle tasks --no-daemon --stacktrace
+
+      # 9. Build APK
+      - name: Build Debug APK
+        shell: bash
+        run: |
+          set -e
+
+          cd "$ANDROID_DIR"
 
           gradle clean assembleDebug \
-            --stacktrace \
-            --no-daemon
+            --no-daemon \
+            --stacktrace
 
-      - name: Find APK
+      # 10. Find APK
+      - name: Find generated APK
+        shell: bash
         run: |
           echo "===== APK OUTPUT ====="
 
@@ -148,9 +211,10 @@ jobs:
             -name "*.apk" \
             -print
 
-      - name: Upload APK
+      # 11. Upload APK
+      - name: Upload NovaSearch APK
         uses: actions/upload-artifact@v4
         with:
-          name: NovaSearch-debug-apk
+          name: NovaSearch-V2-debug-apk
           path: "${{ env.ANDROID_DIR }}/app/build/outputs/apk/debug/*.apk"
           if-no-files-found: error
